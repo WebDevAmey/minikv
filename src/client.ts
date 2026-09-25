@@ -20,7 +20,7 @@ rl.on("line", (line) => {
     const command = line.trim();
 
     if (!command) {
-        rl.prompt();=
+        rl.prompt();
         return;
     }
 
