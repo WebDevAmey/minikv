@@ -1,11 +1,19 @@
 import net from "node:net";
 import readline from "node:readline";
 
+const port = Number(process.argv[2]) || 4000;
+
 const client = net.createConnection(
-    { port: 4000 },
+    { port },
     () => {
-        console.log("Connected to KV server");
-        console.log("Commands: PUT key value | GET key | DELETE key");
+        console.log(
+            `Connected to node on port ${port}`
+        );
+
+        console.log(
+            "Commands: PUT key value | GET key | DELETE key"
+        );
+
         rl.prompt();
     }
 );
@@ -17,6 +25,7 @@ const rl = readline.createInterface({
 });
 
 rl.on("line", (line) => {
+
     const command = line.trim();
 
     if (!command) {
@@ -28,15 +37,20 @@ rl.on("line", (line) => {
 });
 
 client.on("data", (data) => {
+
     console.log(data.toString().trim());
+
     rl.prompt();
 });
 
 client.on("error", (err) => {
+
     console.log("Error:", err.message);
 });
 
 client.on("close", () => {
+
     console.log("Disconnected from server");
+
     process.exit(0);
 });

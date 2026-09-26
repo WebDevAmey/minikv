@@ -1,10 +1,19 @@
 import net from "node:net";
 import fs from "node:fs";
 
-const store = new Map<string, string>();
+const port = Number(process.argv[2]) || 4000;
+const nodeId = process.argv[3] || "node1";
 
-const DATA_FILE = "data.json";
-const WAL_FILE = "wal.log";
+const nodes = [
+    { id: "node1", port: 4000 },
+    { id: "node2", port: 4001 },
+    { id: "node3", port: 4002 }
+];
+
+const DATA_FILE = `data-${nodeId}.json`;
+const WAL_FILE = `wal-${nodeId}.log`;
+
+const store = new Map<string, string>();
 
 function loadData() {
     if (!fs.existsSync(DATA_FILE)) return;
@@ -19,11 +28,9 @@ function loadData() {
 }
 
 function saveData() {
-    const data = Object.fromEntries(store);
-
     fs.writeFileSync(
         DATA_FILE,
-        JSON.stringify(data, null, 2)
+        JSON.stringify(Object.fromEntries(store), null, 2)
     );
 }
 
@@ -36,7 +43,7 @@ function replayWAL() {
 
     const logs = fs.readFileSync(WAL_FILE, "utf-8")
         .split("\n")
-        .filter(line => line.trim() !== "");
+        .filter(line => line.trim());
 
     for (const command of logs) {
         const parts = command.split(" ");
@@ -47,15 +54,33 @@ function replayWAL() {
 
         if (operation === "PUT") {
             store.set(key, value);
-        } else if (operation === "DELETE") {
+        }
+
+        else if (operation === "DELETE") {
             store.delete(key);
         }
     }
 }
 
+function sendToNode(port: number, command: string) {
+
+    const socket = net.createConnection(
+        { port },
+        () => {
+            socket.write(command + "\n");
+        }
+    );
+
+    socket.on("data", () => {
+        socket.end();
+    });
+
+    socket.on("error", () => {});
+}
+
 const server = net.createServer((socket) => {
 
-    console.log("Client connected");
+    console.log(`Client connected to ${nodeId}`);
 
     socket.on("data", (data) => {
 
@@ -75,20 +100,58 @@ const server = net.createServer((socket) => {
         if (operation === "PUT") {
 
             if (!key || !value) {
-                socket.write("ERROR Usage: PUT key value\n");
+                socket.write(
+                    "ERROR Usage: PUT key value\n"
+                );
                 return;
             }
 
             writeToWAL(command);
+
             store.set(key, value);
+
+            saveData();
+
+            for (const node of nodes) {
+
+                if (node.id !== nodeId) {
+
+                    sendToNode(
+                        node.port,
+                        `REPLICATE ${key} ${value}`
+                    );
+                }
+            }
+
+            socket.write("OK\n");
+        }
+
+        else if (operation === "REPLICATE") {
+
+            if (!key || !value) {
+                socket.write(
+                    "ERROR Invalid replication\n"
+                );
+                return;
+            }
+
+            store.set(key, value);
+
+            writeToWAL(
+                `PUT ${key} ${value}`
+            );
+
             saveData();
 
             socket.write("OK\n");
+        }
 
-        } else if (operation === "GET") {
+        else if (operation === "GET") {
 
             if (!key) {
-                socket.write("ERROR Usage: GET key\n");
+                socket.write(
+                    "ERROR Usage: GET key\n"
+                );
                 return;
             }
 
@@ -99,34 +162,46 @@ const server = net.createServer((socket) => {
                     ? "NOT_FOUND\n"
                     : `${result}\n`
             );
+        }
 
-        } else if (operation === "DELETE") {
+        else if (operation === "DELETE") {
 
             if (!key) {
-                socket.write("ERROR Usage: DELETE key\n");
+                socket.write(
+                    "ERROR Usage: DELETE key\n"
+                );
                 return;
             }
 
             const deleted = store.delete(key);
 
             if (deleted) {
+
                 writeToWAL(command);
+
                 saveData();
+
                 socket.write("OK\n");
+
             } else {
+
                 socket.write("NOT_FOUND\n");
             }
+        }
 
-        } else if (operation === "PING") {
+        else if (operation === "PING") {
 
             socket.write("PONG\n");
+        }
 
-        } else if (operation === "QUIT") {
+        else if (operation === "QUIT") {
 
             socket.write("BYE\n");
-            socket.end();
 
-        } else {
+            socket.end();
+        }
+
+        else {
 
             socket.write(
                 `ERROR Unknown command: ${operation}\n`
@@ -135,13 +210,19 @@ const server = net.createServer((socket) => {
     });
 
     socket.on("close", () => {
-        console.log("Client disconnected");
+        console.log(
+            `Connection closed on ${nodeId}`
+        );
     });
 });
 
 loadData();
+
 replayWAL();
 
-server.listen(4000, () => {
-    console.log("KV server running on port 4000");
+server.listen(port, () => {
+
+    console.log(
+        `${nodeId} running on port ${port}`
+    );
 });
