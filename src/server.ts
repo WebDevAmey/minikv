@@ -12,6 +12,7 @@ const nodes = [
 
 const DATA_FILE = `data-${nodeId}.json`;
 const WAL_FILE = `wal-${nodeId}.log`;
+const RAFT_FILE = `raft-${nodeId}.json`;
 
 const store = new Map<string, string>();
 
@@ -68,6 +69,31 @@ function replayWAL() {
     }
 }
 
+function saveRaftState() {
+    fs.writeFileSync(
+        RAFT_FILE,
+        JSON.stringify(
+            {
+                currentTerm,
+                votedFor
+            },
+            null,
+            2
+        )
+    );
+}
+
+function loadRaftState() {
+    if (!fs.existsSync(RAFT_FILE)) return;
+
+    const data = JSON.parse(
+        fs.readFileSync(RAFT_FILE, "utf-8")
+    );
+
+    currentTerm = data.currentTerm || 0;
+    votedFor = data.votedFor || null;
+}
+
 function resetElectionTimer() {
     clearTimeout(electionTimer);
 
@@ -108,11 +134,12 @@ function sendMessage(
 }
 
 function startElection() {
-
     state = "candidate";
     currentTerm++;
     votedFor = nodeId;
     votesReceived = 1;
+
+    saveRaftState();
 
     console.log(
         `${nodeId} started election for term ${currentTerm}`
@@ -121,14 +148,12 @@ function startElection() {
     resetElectionTimer();
 
     for (const node of nodes) {
-
         if (node.id === nodeId) continue;
 
         sendMessage(
             node.port,
             `REQUEST_VOTE ${currentTerm} ${nodeId}`,
             (response) => {
-
                 if (
                     response === "VOTE_GRANTED" &&
                     state === "candidate"
@@ -148,7 +173,6 @@ function startElection() {
 }
 
 function becomeLeader() {
-
     state = "leader";
 
     clearTimeout(electionTimer);
@@ -161,11 +185,9 @@ function becomeLeader() {
 }
 
 function sendHeartbeats() {
-
     if (state !== "leader") return;
 
     for (const node of nodes) {
-
         if (node.id === nodeId) continue;
 
         sendMessage(
@@ -177,11 +199,8 @@ function sendHeartbeats() {
     setTimeout(sendHeartbeats, 2000);
 }
 
-function replicate(
-    command: string
-) {
+function replicate(command: string) {
     for (const node of nodes) {
-
         if (node.id === nodeId) continue;
 
         sendMessage(
@@ -205,7 +224,6 @@ const server = net.createServer((socket) => {
         const key = parts[1];
         const value = parts.slice(2).join(" ");
 
-        // Client PUT
         if (operation === "PUT") {
 
             if (state !== "leader") {
@@ -221,7 +239,9 @@ const server = net.createServer((socket) => {
             }
 
             writeToWAL(command);
+
             store.set(key, value);
+
             saveData();
 
             replicate(command);
@@ -229,7 +249,6 @@ const server = net.createServer((socket) => {
             socket.write("OK\n");
         }
 
-        // Client GET
         else if (operation === "GET") {
 
             if (!key) {
@@ -248,7 +267,6 @@ const server = net.createServer((socket) => {
             );
         }
 
-        // Client DELETE
         else if (operation === "DELETE") {
 
             if (state !== "leader") {
@@ -271,6 +289,7 @@ const server = net.createServer((socket) => {
             }
 
             writeToWAL(command);
+
             saveData();
 
             replicate(command);
@@ -278,7 +297,6 @@ const server = net.createServer((socket) => {
             socket.write("OK\n");
         }
 
-        // Vote request
         else if (operation === "REQUEST_VOTE") {
 
             const term = Number(parts[1]);
@@ -290,42 +308,58 @@ const server = net.createServer((socket) => {
             }
 
             if (term > currentTerm) {
+
                 currentTerm = term;
                 state = "follower";
                 votedFor = null;
+
+                saveRaftState();
             }
 
             if (
                 votedFor === null ||
                 votedFor === candidateId
             ) {
+
                 votedFor = candidateId;
+
+                saveRaftState();
+
                 resetElectionTimer();
+
                 socket.write("VOTE_GRANTED\n");
+
             } else {
+
                 socket.write("VOTE_DENIED\n");
             }
         }
 
-        // Heartbeat
         else if (operation === "HEARTBEAT") {
 
             const term = Number(parts[1]);
 
-            if (term >= currentTerm) {
+            if (term < currentTerm) {
+                socket.write("STALE\n");
+                return;
+            }
+
+            if (term > currentTerm) {
+
                 currentTerm = term;
                 state = "follower";
                 votedFor = null;
 
-                resetElectionTimer();
-
-                socket.write("ALIVE\n");
-            } else {
-                socket.write("STALE\n");
+                saveRaftState();
             }
+
+            state = "follower";
+
+            resetElectionTimer();
+
+            socket.write("ALIVE\n");
         }
 
-        // Replication
         else if (operation === "REPLICATE") {
 
             const replicatedCommand =
@@ -351,6 +385,7 @@ const server = net.createServer((socket) => {
                 );
 
                 writeToWAL(replicatedCommand);
+
                 saveData();
             }
 
@@ -361,6 +396,7 @@ const server = net.createServer((socket) => {
                 store.delete(replicatedKey);
 
                 writeToWAL(replicatedCommand);
+
                 saveData();
             }
 
@@ -375,6 +411,7 @@ const server = net.createServer((socket) => {
         else if (operation === "QUIT") {
 
             socket.write("BYE\n");
+
             socket.end();
         }
 
@@ -388,12 +425,17 @@ const server = net.createServer((socket) => {
 });
 
 loadData();
+loadRaftState();
 replayWAL();
 
 server.listen(port, () => {
 
     console.log(
         `${nodeId} running on port ${port}`
+    );
+
+    console.log(
+        `Term: ${currentTerm}, VotedFor: ${votedFor}`
     );
 
     resetElectionTimer();
