@@ -4,9 +4,6 @@ import fs from "node:fs";
 const port = Number(process.argv[2]) || 4000;
 const nodeId = process.argv[3] || "node1";
 
-const leaderPort = 4000;
-const isLeader = port === leaderPort;
-
 const nodes = [
     { id: "node1", port: 4000 },
     { id: "node2", port: 4001 },
@@ -17,6 +14,12 @@ const DATA_FILE = `data-${nodeId}.json`;
 const WAL_FILE = `wal-${nodeId}.log`;
 
 const store = new Map<string, string>();
+
+let state = "follower";
+let currentTerm = 0;
+let votedFor: string | null = null;
+let votesReceived = 0;
+let electionTimer: NodeJS.Timeout;
 
 function loadData() {
     if (!fs.existsSync(DATA_FILE)) return;
@@ -59,42 +62,133 @@ function replayWAL() {
             store.set(key, value);
         }
 
-        else if (operation === "DELETE") {
+        if (operation === "DELETE") {
             store.delete(key);
         }
     }
 }
 
-function sendToNode(port: number, command: string) {
+function resetElectionTimer() {
+    clearTimeout(electionTimer);
 
-    const socket = net.createConnection(
-        { port },
-        () => {
-            socket.write(command + "\n");
+    const timeout = 4000 + Math.random() * 3000;
+
+    electionTimer = setTimeout(() => {
+        if (state !== "leader") {
+            startElection();
         }
-    );
-
-    socket.on("data", () => {
-        socket.end();
-    });
-
-    socket.on("error", () => {});
+    }, timeout);
 }
 
-function sendHeartbeat(port: number) {
-
+function sendMessage(
+    targetPort: number,
+    message: string,
+    callback?: (response: string) => void
+) {
     const socket = net.createConnection(
-        { port },
+        { port: targetPort },
         () => {
-            socket.write("HEARTBEAT\n");
+            socket.write(message + "\n");
         }
     );
 
-    socket.on("data", () => {
-        socket.end();
+    let response = "";
+
+    socket.on("data", (data) => {
+        response += data.toString();
     });
 
-    socket.on("error", () => {});
+    socket.on("end", () => {
+        callback?.(response.trim());
+    });
+
+    socket.on("error", () => {
+        socket.destroy();
+    });
+}
+
+function startElection() {
+
+    state = "candidate";
+    currentTerm++;
+    votedFor = nodeId;
+    votesReceived = 1;
+
+    console.log(
+        `${nodeId} started election for term ${currentTerm}`
+    );
+
+    resetElectionTimer();
+
+    for (const node of nodes) {
+
+        if (node.id === nodeId) continue;
+
+        sendMessage(
+            node.port,
+            `REQUEST_VOTE ${currentTerm} ${nodeId}`,
+            (response) => {
+
+                if (
+                    response === "VOTE_GRANTED" &&
+                    state === "candidate"
+                ) {
+                    votesReceived++;
+
+                    const majority =
+                        Math.floor(nodes.length / 2) + 1;
+
+                    if (votesReceived >= majority) {
+                        becomeLeader();
+                    }
+                }
+            }
+        );
+    }
+}
+
+function becomeLeader() {
+
+    state = "leader";
+
+    clearTimeout(electionTimer);
+
+    console.log(
+        `${nodeId} became LEADER for term ${currentTerm}`
+    );
+
+    sendHeartbeats();
+}
+
+function sendHeartbeats() {
+
+    if (state !== "leader") return;
+
+    for (const node of nodes) {
+
+        if (node.id === nodeId) continue;
+
+        sendMessage(
+            node.port,
+            `HEARTBEAT ${currentTerm} ${nodeId}`
+        );
+    }
+
+    setTimeout(sendHeartbeats, 2000);
+}
+
+function replicate(
+    command: string
+) {
+    for (const node of nodes) {
+
+        if (node.id === nodeId) continue;
+
+        sendMessage(
+            node.port,
+            `REPLICATE ${command}`
+        );
+    }
 }
 
 const server = net.createServer((socket) => {
@@ -103,10 +197,7 @@ const server = net.createServer((socket) => {
 
         const command = data.toString().trim();
 
-        if (!command) {
-            socket.write("ERROR Empty command\n");
-            return;
-        }
+        if (!command) return;
 
         const parts = command.split(" ");
 
@@ -114,9 +205,10 @@ const server = net.createServer((socket) => {
         const key = parts[1];
         const value = parts.slice(2).join(" ");
 
+        // Client PUT
         if (operation === "PUT") {
 
-            if (!isLeader) {
+            if (state !== "leader") {
                 socket.write("ERROR Not leader\n");
                 return;
             }
@@ -132,40 +224,12 @@ const server = net.createServer((socket) => {
             store.set(key, value);
             saveData();
 
-            for (const node of nodes) {
-
-                if (node.id !== nodeId) {
-
-                    sendToNode(
-                        node.port,
-                        `REPLICATE ${key} ${value}`
-                    );
-                }
-            }
+            replicate(command);
 
             socket.write("OK\n");
         }
 
-        else if (operation === "REPLICATE") {
-
-            if (!key || !value) {
-                socket.write(
-                    "ERROR Invalid replication\n"
-                );
-                return;
-            }
-
-            store.set(key, value);
-
-            writeToWAL(
-                `PUT ${key} ${value}`
-            );
-
-            saveData();
-
-            socket.write("OK\n");
-        }
-
+        // Client GET
         else if (operation === "GET") {
 
             if (!key) {
@@ -184,9 +248,10 @@ const server = net.createServer((socket) => {
             );
         }
 
+        // Client DELETE
         else if (operation === "DELETE") {
 
-            if (!isLeader) {
+            if (state !== "leader") {
                 socket.write("ERROR Not leader\n");
                 return;
             }
@@ -208,40 +273,98 @@ const server = net.createServer((socket) => {
             writeToWAL(command);
             saveData();
 
-            for (const node of nodes) {
-
-                if (node.id !== nodeId) {
-
-                    sendToNode(
-                        node.port,
-                        `REPLICATE_DELETE ${key}`
-                    );
-                }
-            }
+            replicate(command);
 
             socket.write("OK\n");
         }
 
-        else if (operation === "REPLICATE_DELETE") {
+        // Vote request
+        else if (operation === "REQUEST_VOTE") {
 
-            if (!key) {
-                socket.write(
-                    "ERROR Invalid replication\n"
-                );
+            const term = Number(parts[1]);
+            const candidateId = parts[2];
+
+            if (term < currentTerm) {
+                socket.write("VOTE_DENIED\n");
                 return;
             }
 
-            store.delete(key);
+            if (term > currentTerm) {
+                currentTerm = term;
+                state = "follower";
+                votedFor = null;
+            }
 
-            writeToWAL(`DELETE ${key}`);
-            saveData();
-
-            socket.write("OK\n");
+            if (
+                votedFor === null ||
+                votedFor === candidateId
+            ) {
+                votedFor = candidateId;
+                resetElectionTimer();
+                socket.write("VOTE_GRANTED\n");
+            } else {
+                socket.write("VOTE_DENIED\n");
+            }
         }
 
+        // Heartbeat
         else if (operation === "HEARTBEAT") {
 
-            socket.write("ALIVE\n");
+            const term = Number(parts[1]);
+
+            if (term >= currentTerm) {
+                currentTerm = term;
+                state = "follower";
+                votedFor = null;
+
+                resetElectionTimer();
+
+                socket.write("ALIVE\n");
+            } else {
+                socket.write("STALE\n");
+            }
+        }
+
+        // Replication
+        else if (operation === "REPLICATE") {
+
+            const replicatedCommand =
+                parts.slice(1).join(" ");
+
+            const replicatedParts =
+                replicatedCommand.split(" ");
+
+            const replicatedOperation =
+                replicatedParts[0];
+
+            const replicatedKey =
+                replicatedParts[1];
+
+            const replicatedValue =
+                replicatedParts.slice(2).join(" ");
+
+            if (replicatedOperation === "PUT") {
+
+                store.set(
+                    replicatedKey,
+                    replicatedValue
+                );
+
+                writeToWAL(replicatedCommand);
+                saveData();
+            }
+
+            else if (
+                replicatedOperation === "DELETE"
+            ) {
+
+                store.delete(replicatedKey);
+
+                writeToWAL(replicatedCommand);
+                saveData();
+            }
+
+            socket.write("OK\n");
         }
 
         else if (operation === "PING") {
@@ -270,22 +393,8 @@ replayWAL();
 server.listen(port, () => {
 
     console.log(
-        `${nodeId} running on port ${port} ${
-            isLeader ? "(LEADER)" : "(FOLLOWER)"
-        }`
+        `${nodeId} running on port ${port}`
     );
 
-    if (isLeader) {
-
-        setInterval(() => {
-
-            for (const node of nodes) {
-
-                if (node.id !== nodeId) {
-                    sendHeartbeat(node.port);
-                }
-            }
-
-        }, 2000);
-    }
+    resetElectionTimer();
 });
