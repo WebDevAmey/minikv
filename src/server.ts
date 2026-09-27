@@ -4,6 +4,9 @@ import fs from "node:fs";
 const port = Number(process.argv[2]) || 4000;
 const nodeId = process.argv[3] || "node1";
 
+const leaderPort = 4000;
+const isLeader = port === leaderPort;
+
 const nodes = [
     { id: "node1", port: 4000 },
     { id: "node2", port: 4001 },
@@ -80,7 +83,7 @@ function sendToNode(port: number, command: string) {
 
 const server = net.createServer((socket) => {
 
-    console.log(`Client connected to ${nodeId}`);
+    console.log(`Connection on ${nodeId}`);
 
     socket.on("data", (data) => {
 
@@ -97,7 +100,13 @@ const server = net.createServer((socket) => {
         const key = parts[1];
         const value = parts.slice(2).join(" ");
 
+        // PUT
         if (operation === "PUT") {
+
+            if (!isLeader) {
+                socket.write("ERROR Not leader\n");
+                return;
+            }
 
             if (!key || !value) {
                 socket.write(
@@ -107,9 +116,7 @@ const server = net.createServer((socket) => {
             }
 
             writeToWAL(command);
-
             store.set(key, value);
-
             saveData();
 
             for (const node of nodes) {
@@ -126,6 +133,7 @@ const server = net.createServer((socket) => {
             socket.write("OK\n");
         }
 
+        // REPLICATE
         else if (operation === "REPLICATE") {
 
             if (!key || !value) {
@@ -146,6 +154,7 @@ const server = net.createServer((socket) => {
             socket.write("OK\n");
         }
 
+        // GET
         else if (operation === "GET") {
 
             if (!key) {
@@ -164,7 +173,13 @@ const server = net.createServer((socket) => {
             );
         }
 
+        // DELETE
         else if (operation === "DELETE") {
+
+            if (!isLeader) {
+                socket.write("ERROR Not leader\n");
+                return;
+            }
 
             if (!key) {
                 socket.write(
@@ -175,29 +190,56 @@ const server = net.createServer((socket) => {
 
             const deleted = store.delete(key);
 
-            if (deleted) {
-
-                writeToWAL(command);
-
-                saveData();
-
-                socket.write("OK\n");
-
-            } else {
-
+            if (!deleted) {
                 socket.write("NOT_FOUND\n");
+                return;
             }
+
+            writeToWAL(command);
+            saveData();
+
+            for (const node of nodes) {
+
+                if (node.id !== nodeId) {
+
+                    sendToNode(
+                        node.port,
+                        `REPLICATE_DELETE ${key}`
+                    );
+                }
+            }
+
+            socket.write("OK\n");
         }
 
+        // REPLICATE DELETE
+        else if (operation === "REPLICATE_DELETE") {
+
+            if (!key) {
+                socket.write(
+                    "ERROR Invalid replication\n"
+                );
+                return;
+            }
+
+            store.delete(key);
+
+            writeToWAL(`DELETE ${key}`);
+            saveData();
+
+            socket.write("OK\n");
+        }
+
+        // PING
         else if (operation === "PING") {
 
             socket.write("PONG\n");
         }
 
+        // QUIT
         else if (operation === "QUIT") {
 
             socket.write("BYE\n");
-
             socket.end();
         }
 
@@ -210,19 +252,18 @@ const server = net.createServer((socket) => {
     });
 
     socket.on("close", () => {
-        console.log(
-            `Connection closed on ${nodeId}`
-        );
+        console.log(`Connection closed on ${nodeId}`);
     });
 });
 
 loadData();
-
 replayWAL();
 
 server.listen(port, () => {
 
     console.log(
-        `${nodeId} running on port ${port}`
+        `${nodeId} running on port ${port} ${
+            isLeader ? "(LEADER)" : "(FOLLOWER)"
+        }`
     );
 });

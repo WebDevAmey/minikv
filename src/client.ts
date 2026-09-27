@@ -6,6 +6,7 @@ const port = Number(process.argv[2]) || 4000;
 const client = net.createConnection(
     { port },
     () => {
+
         console.log(
             `Connected to node on port ${port}`
         );
