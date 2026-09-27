@@ -81,9 +81,23 @@ function sendToNode(port: number, command: string) {
     socket.on("error", () => {});
 }
 
-const server = net.createServer((socket) => {
+function sendHeartbeat(port: number) {
 
-    console.log(`Connection on ${nodeId}`);
+    const socket = net.createConnection(
+        { port },
+        () => {
+            socket.write("HEARTBEAT\n");
+        }
+    );
+
+    socket.on("data", () => {
+        socket.end();
+    });
+
+    socket.on("error", () => {});
+}
+
+const server = net.createServer((socket) => {
 
     socket.on("data", (data) => {
 
@@ -100,7 +114,6 @@ const server = net.createServer((socket) => {
         const key = parts[1];
         const value = parts.slice(2).join(" ");
 
-        // PUT
         if (operation === "PUT") {
 
             if (!isLeader) {
@@ -133,7 +146,6 @@ const server = net.createServer((socket) => {
             socket.write("OK\n");
         }
 
-        // REPLICATE
         else if (operation === "REPLICATE") {
 
             if (!key || !value) {
@@ -154,7 +166,6 @@ const server = net.createServer((socket) => {
             socket.write("OK\n");
         }
 
-        // GET
         else if (operation === "GET") {
 
             if (!key) {
@@ -173,7 +184,6 @@ const server = net.createServer((socket) => {
             );
         }
 
-        // DELETE
         else if (operation === "DELETE") {
 
             if (!isLeader) {
@@ -212,7 +222,6 @@ const server = net.createServer((socket) => {
             socket.write("OK\n");
         }
 
-        // REPLICATE DELETE
         else if (operation === "REPLICATE_DELETE") {
 
             if (!key) {
@@ -230,13 +239,16 @@ const server = net.createServer((socket) => {
             socket.write("OK\n");
         }
 
-        // PING
+        else if (operation === "HEARTBEAT") {
+
+            socket.write("ALIVE\n");
+        }
+
         else if (operation === "PING") {
 
             socket.write("PONG\n");
         }
 
-        // QUIT
         else if (operation === "QUIT") {
 
             socket.write("BYE\n");
@@ -250,10 +262,6 @@ const server = net.createServer((socket) => {
             );
         }
     });
-
-    socket.on("close", () => {
-        console.log(`Connection closed on ${nodeId}`);
-    });
 });
 
 loadData();
@@ -266,4 +274,18 @@ server.listen(port, () => {
             isLeader ? "(LEADER)" : "(FOLLOWER)"
         }`
     );
+
+    if (isLeader) {
+
+        setInterval(() => {
+
+            for (const node of nodes) {
+
+                if (node.id !== nodeId) {
+                    sendHeartbeat(node.port);
+                }
+            }
+
+        }, 2000);
+    }
 });
