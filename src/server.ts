@@ -13,8 +13,16 @@ const nodes = [
 const DATA_FILE = `data-${nodeId}.json`;
 const WAL_FILE = `wal-${nodeId}.log`;
 const RAFT_FILE = `raft-${nodeId}.json`;
+const LOG_FILE = `log-${nodeId}.json`;
+
+type LogEntry = {
+    index: number;
+    term: number;
+    command: string;
+};
 
 const store = new Map<string, string>();
+const raftLog: LogEntry[] = [];
 
 let state = "follower";
 let currentTerm = 0;
@@ -42,15 +50,21 @@ function saveData() {
 }
 
 function writeToWAL(command: string) {
-    fs.appendFileSync(WAL_FILE, command + "\n");
+    fs.appendFileSync(
+        WAL_FILE,
+        command + "\n"
+    );
 }
 
 function replayWAL() {
     if (!fs.existsSync(WAL_FILE)) return;
 
-    const logs = fs.readFileSync(WAL_FILE, "utf-8")
-        .split("\n")
-        .filter(line => line.trim());
+    const logs = fs.readFileSync(
+        WAL_FILE,
+        "utf-8"
+    )
+    .split("\n")
+    .filter(line => line.trim());
 
     for (const command of logs) {
         const parts = command.split(" ");
@@ -87,22 +101,52 @@ function loadRaftState() {
     if (!fs.existsSync(RAFT_FILE)) return;
 
     const data = JSON.parse(
-        fs.readFileSync(RAFT_FILE, "utf-8")
+        fs.readFileSync(
+            RAFT_FILE,
+            "utf-8"
+        )
     );
 
     currentTerm = data.currentTerm || 0;
     votedFor = data.votedFor || null;
 }
 
+function saveLog() {
+    fs.writeFileSync(
+        LOG_FILE,
+        JSON.stringify(
+            raftLog,
+            null,
+            2
+        )
+    );
+}
+
+function loadLog() {
+    if (!fs.existsSync(LOG_FILE)) return;
+
+    const data = JSON.parse(
+        fs.readFileSync(
+            LOG_FILE,
+            "utf-8"
+        )
+    );
+
+    raftLog.push(...data);
+}
+
 function resetElectionTimer() {
     clearTimeout(electionTimer);
 
-    const timeout = 4000 + Math.random() * 3000;
+    const timeout =
+        4000 + Math.random() * 3000;
 
     electionTimer = setTimeout(() => {
+
         if (state !== "leader") {
             startElection();
         }
+
     }, timeout);
 }
 
@@ -112,9 +156,13 @@ function sendMessage(
     callback?: (response: string) => void
 ) {
     const socket = net.createConnection(
-        { port: targetPort },
+        {
+            port: targetPort
+        },
         () => {
-            socket.write(message + "\n");
+            socket.write(
+                message + "\n"
+            );
         }
     );
 
@@ -125,7 +173,9 @@ function sendMessage(
     });
 
     socket.on("end", () => {
-        callback?.(response.trim());
+        callback?.(
+            response.trim()
+        );
     });
 
     socket.on("error", () => {
@@ -134,9 +184,13 @@ function sendMessage(
 }
 
 function startElection() {
+
     state = "candidate";
+
     currentTerm++;
+
     votedFor = nodeId;
+
     votesReceived = 1;
 
     saveRaftState();
@@ -148,22 +202,32 @@ function startElection() {
     resetElectionTimer();
 
     for (const node of nodes) {
-        if (node.id === nodeId) continue;
+
+        if (node.id === nodeId) {
+            continue;
+        }
 
         sendMessage(
             node.port,
             `REQUEST_VOTE ${currentTerm} ${nodeId}`,
             (response) => {
+
                 if (
                     response === "VOTE_GRANTED" &&
                     state === "candidate"
                 ) {
+
                     votesReceived++;
 
                     const majority =
-                        Math.floor(nodes.length / 2) + 1;
+                        Math.floor(
+                            nodes.length / 2
+                        ) + 1;
 
-                    if (votesReceived >= majority) {
+                    if (
+                        votesReceived >=
+                        majority
+                    ) {
                         becomeLeader();
                     }
                 }
@@ -173,9 +237,12 @@ function startElection() {
 }
 
 function becomeLeader() {
+
     state = "leader";
 
-    clearTimeout(electionTimer);
+    clearTimeout(
+        electionTimer
+    );
 
     console.log(
         `${nodeId} became LEADER for term ${currentTerm}`
@@ -185,10 +252,16 @@ function becomeLeader() {
 }
 
 function sendHeartbeats() {
-    if (state !== "leader") return;
+
+    if (state !== "leader") {
+        return;
+    }
 
     for (const node of nodes) {
-        if (node.id === nodeId) continue;
+
+        if (node.id === nodeId) {
+            continue;
+        }
 
         sendMessage(
             node.port,
@@ -196,247 +269,476 @@ function sendHeartbeats() {
         );
     }
 
-    setTimeout(sendHeartbeats, 2000);
+    setTimeout(
+        sendHeartbeats,
+        2000
+    );
 }
 
-function replicate(command: string) {
+function appendLogEntry(
+    command: string
+) {
+
+    const entry: LogEntry = {
+        index: raftLog.length + 1,
+        term: currentTerm,
+        command
+    };
+
+    raftLog.push(entry);
+
+    saveLog();
+
+    return entry;
+}
+
+function replicateLogEntry(
+    entry: LogEntry
+) {
+
+    const message =
+        `APPEND_ENTRY ${entry.index} ${entry.term} ${entry.command}`;
+
     for (const node of nodes) {
-        if (node.id === nodeId) continue;
+
+        if (node.id === nodeId) {
+            continue;
+        }
 
         sendMessage(
             node.port,
-            `REPLICATE ${command}`
+            message
         );
     }
 }
 
-const server = net.createServer((socket) => {
+const server = net.createServer(
+    (socket) => {
 
-    socket.on("data", (data) => {
+        socket.on(
+            "data",
+            (data) => {
 
-        const command = data.toString().trim();
+                const command =
+                    data.toString().trim();
 
-        if (!command) return;
+                if (!command) {
+                    return;
+                }
 
-        const parts = command.split(" ");
+                const parts =
+                    command.split(" ");
 
-        const operation = parts[0].toUpperCase();
-        const key = parts[1];
-        const value = parts.slice(2).join(" ");
+                const operation =
+                    parts[0].toUpperCase();
 
-        if (operation === "PUT") {
+                const key = parts[1];
 
-            if (state !== "leader") {
-                socket.write("ERROR Not leader\n");
-                return;
+                const value =
+                    parts.slice(2).join(" ");
+
+                if (
+                    operation === "PUT"
+                ) {
+
+                    if (
+                        state !== "leader"
+                    ) {
+
+                        socket.write(
+                            "ERROR Not leader\n"
+                        );
+
+                        return;
+                    }
+
+                    if (
+                        !key ||
+                        !value
+                    ) {
+
+                        socket.write(
+                            "ERROR Usage: PUT key value\n"
+                        );
+
+                        return;
+                    }
+
+                    const entry =
+                        appendLogEntry(
+                            command
+                        );
+
+                    writeToWAL(
+                        command
+                    );
+
+                    store.set(
+                        key,
+                        value
+                    );
+
+                    saveData();
+
+                    replicateLogEntry(
+                        entry
+                    );
+
+                    socket.write(
+                        `OK index=${entry.index} term=${entry.term}\n`
+                    );
+                }
+
+                else if (
+                    operation === "GET"
+                ) {
+
+                    if (!key) {
+
+                        socket.write(
+                            "ERROR Usage: GET key\n"
+                        );
+
+                        return;
+                    }
+
+                    const result =
+                        store.get(key);
+
+                    socket.write(
+                        result === undefined
+                            ? "NOT_FOUND\n"
+                            : `${result}\n`
+                    );
+                }
+
+                else if (
+                    operation === "DELETE"
+                ) {
+
+                    if (
+                        state !== "leader"
+                    ) {
+
+                        socket.write(
+                            "ERROR Not leader\n"
+                        );
+
+                        return;
+                    }
+
+                    if (!key) {
+
+                        socket.write(
+                            "ERROR Usage: DELETE key\n"
+                        );
+
+                        return;
+                    }
+
+                    const deleted =
+                        store.delete(key);
+
+                    if (!deleted) {
+
+                        socket.write(
+                            "NOT_FOUND\n"
+                        );
+
+                        return;
+                    }
+
+                    const entry =
+                        appendLogEntry(
+                            command
+                        );
+
+                    writeToWAL(
+                        command
+                    );
+
+                    saveData();
+
+                    replicateLogEntry(
+                        entry
+                    );
+
+                    socket.write(
+                        `OK index=${entry.index} term=${entry.term}\n`
+                    );
+                }
+
+                else if (
+                    operation === "REQUEST_VOTE"
+                ) {
+
+                    const term =
+                        Number(parts[1]);
+
+                    const candidateId =
+                        parts[2];
+
+                    if (
+                        term < currentTerm
+                    ) {
+
+                        socket.write(
+                            "VOTE_DENIED\n"
+                        );
+
+                        return;
+                    }
+
+                    if (
+                        term > currentTerm
+                    ) {
+
+                        currentTerm =
+                            term;
+
+                        state =
+                            "follower";
+
+                        votedFor =
+                            null;
+
+                        saveRaftState();
+                    }
+
+                    if (
+                        votedFor === null ||
+                        votedFor === candidateId
+                    ) {
+
+                        votedFor =
+                            candidateId;
+
+                        saveRaftState();
+
+                        resetElectionTimer();
+
+                        socket.write(
+                            "VOTE_GRANTED\n"
+                        );
+
+                    } else {
+
+                        socket.write(
+                            "VOTE_DENIED\n"
+                        );
+                    }
+                }
+
+                else if (
+                    operation === "HEARTBEAT"
+                ) {
+
+                    const term =
+                        Number(parts[1]);
+
+                    if (
+                        term < currentTerm
+                    ) {
+
+                        socket.write(
+                            "STALE\n"
+                        );
+
+                        return;
+                    }
+
+                    if (
+                        term > currentTerm
+                    ) {
+
+                        currentTerm =
+                            term;
+
+                        votedFor =
+                            null;
+
+                        saveRaftState();
+                    }
+
+                    state =
+                        "follower";
+
+                    resetElectionTimer();
+
+                    socket.write(
+                        "ALIVE\n"
+                    );
+                }
+
+                else if (
+                    operation === "APPEND_ENTRY"
+                ) {
+
+                    const index =
+                        Number(parts[1]);
+
+                    const term =
+                        Number(parts[2]);
+
+                    const logCommand =
+                        parts
+                            .slice(3)
+                            .join(" ");
+
+                    if (
+                        term < currentTerm
+                    ) {
+
+                        socket.write(
+                            "REJECTED\n"
+                        );
+
+                        return;
+                    }
+
+                    if (
+                        term > currentTerm
+                    ) {
+
+                        currentTerm =
+                            term;
+
+                        state =
+                            "follower";
+
+                        votedFor =
+                            null;
+
+                        saveRaftState();
+                    }
+
+                    state =
+                        "follower";
+
+                    resetElectionTimer();
+
+                    const existing =
+                        raftLog.find(
+                            entry =>
+                                entry.index === index
+                        );
+
+                    if (!existing) {
+
+                        const entry: LogEntry = {
+                            index,
+                            term,
+                            command:
+                                logCommand
+                        };
+
+                        raftLog.push(
+                            entry
+                        );
+
+                        saveLog();
+
+                        writeToWAL(
+                            logCommand
+                        );
+
+                        const logParts =
+                            logCommand.split(" ");
+
+                        const logOperation =
+                            logParts[0];
+
+                        const logKey =
+                            logParts[1];
+
+                        const logValue =
+                            logParts
+                                .slice(2)
+                                .join(" ");
+
+                        if (
+                            logOperation ===
+                            "PUT"
+                        ) {
+
+                            store.set(
+                                logKey,
+                                logValue
+                            );
+
+                            saveData();
+                        }
+
+                        if (
+                            logOperation ===
+                            "DELETE"
+                        ) {
+
+                            store.delete(
+                                logKey
+                            );
+
+                            saveData();
+                        }
+                    }
+
+                    socket.write(
+                        "APPENDED\n"
+                    );
+                }
+
+                else if (
+                    operation === "PING"
+                ) {
+
+                    socket.write(
+                        "PONG\n"
+                    );
+                }
+
+                else if (
+                    operation === "QUIT"
+                ) {
+
+                    socket.write(
+                        "BYE\n"
+                    );
+
+                    socket.end();
+                }
+
+                else {
+
+                    socket.write(
+                        `ERROR Unknown command: ${operation}\n`
+                    );
+                }
             }
-
-            if (!key || !value) {
-                socket.write(
-                    "ERROR Usage: PUT key value\n"
-                );
-                return;
-            }
-
-            writeToWAL(command);
-
-            store.set(key, value);
-
-            saveData();
-
-            replicate(command);
-
-            socket.write("OK\n");
-        }
-
-        else if (operation === "GET") {
-
-            if (!key) {
-                socket.write(
-                    "ERROR Usage: GET key\n"
-                );
-                return;
-            }
-
-            const result = store.get(key);
-
-            socket.write(
-                result === undefined
-                    ? "NOT_FOUND\n"
-                    : `${result}\n`
-            );
-        }
-
-        else if (operation === "DELETE") {
-
-            if (state !== "leader") {
-                socket.write("ERROR Not leader\n");
-                return;
-            }
-
-            if (!key) {
-                socket.write(
-                    "ERROR Usage: DELETE key\n"
-                );
-                return;
-            }
-
-            const deleted = store.delete(key);
-
-            if (!deleted) {
-                socket.write("NOT_FOUND\n");
-                return;
-            }
-
-            writeToWAL(command);
-
-            saveData();
-
-            replicate(command);
-
-            socket.write("OK\n");
-        }
-
-        else if (operation === "REQUEST_VOTE") {
-
-            const term = Number(parts[1]);
-            const candidateId = parts[2];
-
-            if (term < currentTerm) {
-                socket.write("VOTE_DENIED\n");
-                return;
-            }
-
-            if (term > currentTerm) {
-
-                currentTerm = term;
-                state = "follower";
-                votedFor = null;
-
-                saveRaftState();
-            }
-
-            if (
-                votedFor === null ||
-                votedFor === candidateId
-            ) {
-
-                votedFor = candidateId;
-
-                saveRaftState();
-
-                resetElectionTimer();
-
-                socket.write("VOTE_GRANTED\n");
-
-            } else {
-
-                socket.write("VOTE_DENIED\n");
-            }
-        }
-
-        else if (operation === "HEARTBEAT") {
-
-            const term = Number(parts[1]);
-
-            if (term < currentTerm) {
-                socket.write("STALE\n");
-                return;
-            }
-
-            if (term > currentTerm) {
-
-                currentTerm = term;
-                state = "follower";
-                votedFor = null;
-
-                saveRaftState();
-            }
-
-            state = "follower";
-
-            resetElectionTimer();
-
-            socket.write("ALIVE\n");
-        }
-
-        else if (operation === "REPLICATE") {
-
-            const replicatedCommand =
-                parts.slice(1).join(" ");
-
-            const replicatedParts =
-                replicatedCommand.split(" ");
-
-            const replicatedOperation =
-                replicatedParts[0];
-
-            const replicatedKey =
-                replicatedParts[1];
-
-            const replicatedValue =
-                replicatedParts.slice(2).join(" ");
-
-            if (replicatedOperation === "PUT") {
-
-                store.set(
-                    replicatedKey,
-                    replicatedValue
-                );
-
-                writeToWAL(replicatedCommand);
-
-                saveData();
-            }
-
-            else if (
-                replicatedOperation === "DELETE"
-            ) {
-
-                store.delete(replicatedKey);
-
-                writeToWAL(replicatedCommand);
-
-                saveData();
-            }
-
-            socket.write("OK\n");
-        }
-
-        else if (operation === "PING") {
-
-            socket.write("PONG\n");
-        }
-
-        else if (operation === "QUIT") {
-
-            socket.write("BYE\n");
-
-            socket.end();
-        }
-
-        else {
-
-            socket.write(
-                `ERROR Unknown command: ${operation}\n`
-            );
-        }
-    });
-});
+        );
+    }
+);
 
 loadData();
 loadRaftState();
+loadLog();
 replayWAL();
 
-server.listen(port, () => {
+server.listen(
+    port,
+    () => {
 
-    console.log(
-        `${nodeId} running on port ${port}`
-    );
+        console.log(
+            `${nodeId} running on port ${port}`
+        );
 
-    console.log(
-        `Term: ${currentTerm}, VotedFor: ${votedFor}`
-    );
+        console.log(
+            `Term: ${currentTerm}, VotedFor: ${votedFor}`
+        );
 
-    resetElectionTimer();
-});
+        console.log(
+            `Log entries: ${raftLog.length}`
+        );
+
+        resetElectionTimer();
+    }
+);
