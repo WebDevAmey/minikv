@@ -11,7 +11,6 @@ const nodes = [
 ];
 
 const DATA_FILE = `data-${nodeId}.json`;
-const WAL_FILE = `wal-${nodeId}.log`;
 const RAFT_FILE = `raft-${nodeId}.json`;
 const LOG_FILE = `log-${nodeId}.json`;
 
@@ -27,6 +26,10 @@ const raftLog: LogEntry[] = [];
 let state = "follower";
 let currentTerm = 0;
 let votedFor: string | null = null;
+
+let commitIndex = 0;
+let lastApplied = 0;
+
 let votesReceived = 0;
 let electionTimer: NodeJS.Timeout;
 
@@ -45,42 +48,12 @@ function loadData() {
 function saveData() {
     fs.writeFileSync(
         DATA_FILE,
-        JSON.stringify(Object.fromEntries(store), null, 2)
+        JSON.stringify(
+            Object.fromEntries(store),
+            null,
+            2
+        )
     );
-}
-
-function writeToWAL(command: string) {
-    fs.appendFileSync(
-        WAL_FILE,
-        command + "\n"
-    );
-}
-
-function replayWAL() {
-    if (!fs.existsSync(WAL_FILE)) return;
-
-    const logs = fs.readFileSync(
-        WAL_FILE,
-        "utf-8"
-    )
-    .split("\n")
-    .filter(line => line.trim());
-
-    for (const command of logs) {
-        const parts = command.split(" ");
-
-        const operation = parts[0];
-        const key = parts[1];
-        const value = parts.slice(2).join(" ");
-
-        if (operation === "PUT") {
-            store.set(key, value);
-        }
-
-        if (operation === "DELETE") {
-            store.delete(key);
-        }
-    }
 }
 
 function saveRaftState() {
@@ -89,7 +62,9 @@ function saveRaftState() {
         JSON.stringify(
             {
                 currentTerm,
-                votedFor
+                votedFor,
+                commitIndex,
+                lastApplied
             },
             null,
             2
@@ -109,6 +84,8 @@ function loadRaftState() {
 
     currentTerm = data.currentTerm || 0;
     votedFor = data.votedFor || null;
+    commitIndex = data.commitIndex || 0;
+    lastApplied = data.lastApplied || 0;
 }
 
 function saveLog() {
@@ -133,6 +110,40 @@ function loadLog() {
     );
 
     raftLog.push(...data);
+}
+
+function applyCommand(command: string) {
+    const parts = command.split(" ");
+
+    const operation = parts[0];
+    const key = parts[1];
+    const value = parts.slice(2).join(" ");
+
+    if (operation === "PUT") {
+        store.set(key, value);
+    }
+
+    if (operation === "DELETE") {
+        store.delete(key);
+    }
+}
+
+function applyCommittedEntries() {
+    while (lastApplied < commitIndex) {
+
+        const entry = raftLog.find(
+            e => e.index === lastApplied + 1
+        );
+
+        if (!entry) break;
+
+        applyCommand(entry.command);
+
+        lastApplied++;
+
+        saveData();
+        saveRaftState();
+    }
 }
 
 function resetElectionTimer() {
@@ -168,7 +179,7 @@ function sendMessage(
 
     let response = "";
 
-    socket.on("data", (data) => {
+    socket.on("data", data => {
         response += data.toString();
     });
 
@@ -184,6 +195,10 @@ function sendMessage(
 }
 
 function startElection() {
+
+    if (state === "leader") {
+        return;
+    }
 
     state = "candidate";
 
@@ -210,11 +225,17 @@ function startElection() {
         sendMessage(
             node.port,
             `REQUEST_VOTE ${currentTerm} ${nodeId}`,
-            (response) => {
+            response => {
 
                 if (
-                    response === "VOTE_GRANTED" &&
-                    state === "candidate"
+                    state !== "candidate"
+                ) {
+                    return;
+                }
+
+                if (
+                    response ===
+                    "VOTE_GRANTED"
                 ) {
 
                     votesReceived++;
@@ -238,6 +259,12 @@ function startElection() {
 
 function becomeLeader() {
 
+    if (
+        state === "leader"
+    ) {
+        return;
+    }
+
     state = "leader";
 
     clearTimeout(
@@ -253,7 +280,9 @@ function becomeLeader() {
 
 function sendHeartbeats() {
 
-    if (state !== "leader") {
+    if (
+        state !== "leader"
+    ) {
         return;
     }
 
@@ -265,20 +294,19 @@ function sendHeartbeats() {
 
         sendMessage(
             node.port,
-            `HEARTBEAT ${currentTerm} ${nodeId}`
+            `HEARTBEAT ${currentTerm} ${nodeId} ${commitIndex}`
         );
     }
 
     setTimeout(
         sendHeartbeats,
-        2000
+        1500
     );
 }
 
 function appendLogEntry(
     command: string
 ) {
-
     const entry: LogEntry = {
         index: raftLog.length + 1,
         term: currentTerm,
@@ -292,12 +320,19 @@ function appendLogEntry(
     return entry;
 }
 
-function replicateLogEntry(
-    entry: LogEntry
+function replicateEntry(
+    entry: LogEntry,
+    callback: (success: boolean) => void
 ) {
 
-    const message =
-        `APPEND_ENTRY ${entry.index} ${entry.term} ${entry.command}`;
+    let acknowledgements = 1;
+    let completed = 0;
+    let finished = false;
+
+    const majority =
+        Math.floor(
+            nodes.length / 2
+        ) + 1;
 
     for (const node of nodes) {
 
@@ -307,17 +342,72 @@ function replicateLogEntry(
 
         sendMessage(
             node.port,
-            message
+            `APPEND_ENTRY ${currentTerm} ${commitIndex} ${entry.index} ${entry.term} ${entry.command}`,
+            response => {
+
+                if (finished) {
+                    return;
+                }
+
+                completed++;
+
+                if (
+                    response ===
+                    "APPENDED"
+                ) {
+                    acknowledgements++;
+                }
+
+                if (
+                    acknowledgements >=
+                    majority
+                ) {
+
+                    finished = true;
+
+                    callback(true);
+
+                    return;
+                }
+
+                if (
+                    completed ===
+                    nodes.length - 1
+                ) {
+
+                    finished = true;
+
+                    callback(false);
+                }
+            }
         );
     }
 }
 
+function commitEntry(
+    entry: LogEntry
+) {
+
+    if (
+        entry.index >
+        commitIndex
+    ) {
+
+        commitIndex =
+            entry.index;
+
+        applyCommittedEntries();
+
+        saveRaftState();
+    }
+}
+
 const server = net.createServer(
-    (socket) => {
+    socket => {
 
         socket.on(
             "data",
-            (data) => {
+            data => {
 
                 const command =
                     data.toString().trim();
@@ -369,23 +459,27 @@ const server = net.createServer(
                             command
                         );
 
-                    writeToWAL(
-                        command
-                    );
+                    replicateEntry(
+                        entry,
+                        success => {
 
-                    store.set(
-                        key,
-                        value
-                    );
+                            if (!success) {
 
-                    saveData();
+                                socket.write(
+                                    "ERROR Majority not reached\n"
+                                );
 
-                    replicateLogEntry(
-                        entry
-                    );
+                                return;
+                            }
 
-                    socket.write(
-                        `OK index=${entry.index} term=${entry.term}\n`
+                            commitEntry(
+                                entry
+                            );
+
+                            socket.write(
+                                `OK index=${entry.index} term=${entry.term}\n`
+                            );
+                        }
                     );
                 }
 
@@ -436,10 +530,9 @@ const server = net.createServer(
                         return;
                     }
 
-                    const deleted =
-                        store.delete(key);
-
-                    if (!deleted) {
+                    if (
+                        !store.has(key)
+                    ) {
 
                         socket.write(
                             "NOT_FOUND\n"
@@ -453,23 +546,33 @@ const server = net.createServer(
                             command
                         );
 
-                    writeToWAL(
-                        command
-                    );
+                    replicateEntry(
+                        entry,
+                        success => {
 
-                    saveData();
+                            if (!success) {
 
-                    replicateLogEntry(
-                        entry
-                    );
+                                socket.write(
+                                    "ERROR Majority not reached\n"
+                                );
 
-                    socket.write(
-                        `OK index=${entry.index} term=${entry.term}\n`
+                                return;
+                            }
+
+                            commitEntry(
+                                entry
+                            );
+
+                            socket.write(
+                                `OK index=${entry.index} term=${entry.term}\n`
+                            );
+                        }
                     );
                 }
 
                 else if (
-                    operation === "REQUEST_VOTE"
+                    operation ===
+                    "REQUEST_VOTE"
                 ) {
 
                     const term =
@@ -479,7 +582,8 @@ const server = net.createServer(
                         parts[2];
 
                     if (
-                        term < currentTerm
+                        term <
+                        currentTerm
                     ) {
 
                         socket.write(
@@ -490,7 +594,8 @@ const server = net.createServer(
                     }
 
                     if (
-                        term > currentTerm
+                        term >
+                        currentTerm
                     ) {
 
                         currentTerm =
@@ -527,32 +632,45 @@ const server = net.createServer(
                             "VOTE_DENIED\n"
                         );
                     }
+
+                    socket.end();
                 }
 
                 else if (
-                    operation === "HEARTBEAT"
+                    operation ===
+                    "HEARTBEAT"
                 ) {
 
                     const term =
                         Number(parts[1]);
 
+                    const leaderCommit =
+                        Number(parts[3]);
+
                     if (
-                        term < currentTerm
+                        term <
+                        currentTerm
                     ) {
 
                         socket.write(
                             "STALE\n"
                         );
 
+                        socket.end();
+
                         return;
                     }
 
                     if (
-                        term > currentTerm
+                        term >
+                        currentTerm
                     ) {
 
                         currentTerm =
                             term;
+
+                        state =
+                            "follower";
 
                         votedFor =
                             null;
@@ -563,41 +681,68 @@ const server = net.createServer(
                     state =
                         "follower";
 
+                    if (
+                        leaderCommit >
+                        commitIndex
+                    ) {
+
+                        commitIndex =
+                            Math.min(
+                                leaderCommit,
+                                raftLog.length
+                            );
+
+                        applyCommittedEntries();
+                    }
+
                     resetElectionTimer();
 
                     socket.write(
                         "ALIVE\n"
                     );
+
+                    socket.end();
                 }
 
                 else if (
-                    operation === "APPEND_ENTRY"
+                    operation ===
+                    "APPEND_ENTRY"
                 ) {
 
-                    const index =
+                    const term =
                         Number(parts[1]);
 
-                    const term =
+                    const leaderCommit =
                         Number(parts[2]);
+
+                    const index =
+                        Number(parts[3]);
+
+                    const entryTerm =
+                        Number(parts[4]);
 
                     const logCommand =
                         parts
-                            .slice(3)
+                            .slice(5)
                             .join(" ");
 
                     if (
-                        term < currentTerm
+                        term <
+                        currentTerm
                     ) {
 
                         socket.write(
                             "REJECTED\n"
                         );
 
+                        socket.end();
+
                         return;
                     }
 
                     if (
-                        term > currentTerm
+                        term >
+                        currentTerm
                     ) {
 
                         currentTerm =
@@ -620,14 +765,15 @@ const server = net.createServer(
                     const existing =
                         raftLog.find(
                             entry =>
-                                entry.index === index
+                                entry.index ===
+                                index
                         );
 
                     if (!existing) {
 
                         const entry: LogEntry = {
                             index,
-                            term,
+                            term: entryTerm,
                             command:
                                 logCommand
                         };
@@ -637,54 +783,27 @@ const server = net.createServer(
                         );
 
                         saveLog();
+                    }
 
-                        writeToWAL(
-                            logCommand
-                        );
+                    if (
+                        leaderCommit >
+                        commitIndex
+                    ) {
 
-                        const logParts =
-                            logCommand.split(" ");
-
-                        const logOperation =
-                            logParts[0];
-
-                        const logKey =
-                            logParts[1];
-
-                        const logValue =
-                            logParts
-                                .slice(2)
-                                .join(" ");
-
-                        if (
-                            logOperation ===
-                            "PUT"
-                        ) {
-
-                            store.set(
-                                logKey,
-                                logValue
+                        commitIndex =
+                            Math.min(
+                                leaderCommit,
+                                raftLog.length
                             );
 
-                            saveData();
-                        }
-
-                        if (
-                            logOperation ===
-                            "DELETE"
-                        ) {
-
-                            store.delete(
-                                logKey
-                            );
-
-                            saveData();
-                        }
+                        applyCommittedEntries();
                     }
 
                     socket.write(
                         "APPENDED\n"
                     );
+
+                    socket.end();
                 }
 
                 else if (
@@ -694,6 +813,8 @@ const server = net.createServer(
                     socket.write(
                         "PONG\n"
                     );
+
+                    socket.end();
                 }
 
                 else if (
@@ -712,6 +833,8 @@ const server = net.createServer(
                     socket.write(
                         `ERROR Unknown command: ${operation}\n`
                     );
+
+                    socket.end();
                 }
             }
         );
@@ -721,7 +844,24 @@ const server = net.createServer(
 loadData();
 loadRaftState();
 loadLog();
-replayWAL();
+
+if (
+    commitIndex >
+    raftLog.length
+) {
+    commitIndex =
+        raftLog.length;
+}
+
+if (
+    lastApplied >
+    commitIndex
+) {
+    lastApplied =
+        commitIndex;
+}
+
+applyCommittedEntries();
 
 server.listen(
     port,
@@ -732,11 +872,19 @@ server.listen(
         );
 
         console.log(
-            `Term: ${currentTerm}, VotedFor: ${votedFor}`
+            `Term: ${currentTerm}`
+        );
+
+        console.log(
+            `VotedFor: ${votedFor}`
         );
 
         console.log(
             `Log entries: ${raftLog.length}`
+        );
+
+        console.log(
+            `Commit index: ${commitIndex}`
         );
 
         resetElectionTimer();

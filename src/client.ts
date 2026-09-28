@@ -27,7 +27,7 @@ const rl =
         prompt: "> "
     });
 
-rl.on("line", (line) => {
+rl.on("line", line => {
 
     const command =
         line.trim();
@@ -44,7 +44,7 @@ rl.on("line", (line) => {
     );
 });
 
-client.on("data", (data) => {
+client.on("data", data => {
 
     console.log(
         data.toString().trim()
@@ -53,7 +53,7 @@ client.on("data", (data) => {
     rl.prompt();
 });
 
-client.on("error", (err) => {
+client.on("error", err => {
 
     console.log(
         "Error:",
